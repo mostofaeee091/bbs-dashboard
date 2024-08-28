@@ -1,0 +1,73 @@
+image: python:3.6
+
+variables:
+  DOCKER_DRIVER: overlay2
+  IMAGE_TAG: $CI_COMMIT_SHA
+
+stages:
+  - build
+  - deploy
+  - release
+
+build and push docker image:
+  stage: build
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  services:
+    - docker:dind
+  before_script:
+    - echo "$CI_COMMIT_SHA"
+    - amazon-linux-extras install docker
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+  script:
+    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+    - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REGISTRY
+    - docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy to backup server:
+  stage: deploy
+  before_script:
+    - curl -s https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/download-secure-files/-/raw/main/installer | bash
+    - mkdir -p ~/.ssh
+    - ls -lah .secure_files
+    - mv .secure_files/ssh-key-bbs.key ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan $DR_SSH_HOST >> ~/.ssh/known_hosts
+  script:
+    - ssh $SSH_USER@$DR_SSH_HOST "
+        AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY;
+        docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG;
+        docker stop bbs-dashboard || true;
+        docker rm bbs-dashboard || true;
+        docker run -d --name bbs-dashboard --user "1000:1000" --env-file .env.dashboard.test -p 80:80 -p 443:443 --restart unless-stopped $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG;
+      "
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+release in prod:
+  stage: release
+  before_script:
+    - curl -s https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/download-secure-files/-/raw/main/installer | bash
+    - mkdir -p ~/.ssh
+    - ls -lah .secure_files
+    - mv .secure_files/ssh-key-bbs.key ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan $PROD_SSH_HOST >> ~/.ssh/known_hosts
+  script:
+    - ssh $SSH_USER@$PROD_SSH_HOST "
+        AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY;
+        docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG;
+        docker stop bbs-dashboard || true;
+        docker rm bbs-dashboard || true;
+        docker run -d --name bbs-dashboard --user "1000:1000" --env-file .env.dashboard.prod -p 80:80 -p 443:443 --restart unless-stopped $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG;
+      "
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
